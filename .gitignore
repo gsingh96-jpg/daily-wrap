@@ -1,0 +1,15 @@
+# Per-run working files — regenerated every run, never worth committing
+digest.md
+digest.json
+script.md
+shownotes.md
+episode.mp3
+
+# Local run artefacts
+logs/
+episodes/
+site/
+
+__pycache__/
+*.pyc
+.venv/

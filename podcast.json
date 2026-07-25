@@ -1,0 +1,9 @@
+{
+  "title": "Daily Wrap",
+  "description": "A ten-minute weekday briefing on world news, markets and technology, curated from 21 mastheads and read before the ASX opens. Built automatically each morning.",
+  "author": "Gurpreet Singh",
+  "email": "gurpreet_singh_96@hotmail.com",
+  "language": "en-au",
+  "site_url": "https://example.github.io/daily-wrap",
+  "image_url": "https://example.github.io/daily-wrap/cover.png"
+}

@@ -1,0 +1,212 @@
+name: Daily Wrap
+
+# GitHub cron is UTC and Sydney observes DST, so 08:47 local is a moving target.
+# Both crons are registered and the gate job lets exactly one through by
+# comparing Sydney's current UTC offset to the one each cron was written for.
+# This is robust to GitHub's habitual 5-20 minute scheduling delay, which a
+# naive "is it 8am in Sydney?" check is not.
+on:
+  schedule:
+    - cron: '47 21 * * 0-4'   # 08:47 Sydney while AEDT (UTC+11) — Mon-Fri local
+    - cron: '47 22 * * 0-4'   # 08:47 Sydney while AEST (UTC+10) — Mon-Fri local
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish a release and update the feed'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # create releases
+  pages: write      # deploy the feed
+  id-token: write   # required by deploy-pages
+
+concurrency:
+  group: daily-wrap
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      date: ${{ steps.check.outputs.date }}
+      pretty: ${{ steps.check.outputs.pretty }}
+    steps:
+      - id: check
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+          OFFSET=$(TZ=Australia/Sydney date +%z)
+          echo "date=$(TZ=Australia/Sydney date +%F)"                >> "$GITHUB_OUTPUT"
+          echo "pretty=$(TZ=Australia/Sydney date '+%A %-d %B %Y')"  >> "$GITHUB_OUTPUT"
+          echo "Sydney is currently UTC$OFFSET ($(TZ=Australia/Sydney date))"
+
+          if [ -z "${SCHEDULE:-}" ]; then
+            echo "Manual run — proceeding."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          case "$SCHEDULE" in
+            '47 21 * * 0-4') WANT='+1100' ;;   # AEDT
+            '47 22 * * 0-4') WANT='+1000' ;;   # AEST
+            *) echo "::error::Unrecognised schedule '$SCHEDULE'"; exit 1 ;;
+          esac
+
+          if [ "$OFFSET" = "$WANT" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "This cron covers UTC$WANT; skipping so the other one runs."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install edge-tts
+        run: pip install --quiet edge-tts
+
+      - name: Install Claude Code
+        run: |
+          set -euo pipefail
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Fetch feeds
+        run: python fetch_news.py --hours 30
+
+      - name: Curate and write the script
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+        run: |
+          set -euo pipefail
+          # Sending both credentials at once is rejected — keep exactly one.
+          if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+            unset ANTHROPIC_API_KEY
+            echo "Authenticating with the subscription OAuth token."
+          elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            unset CLAUDE_CODE_OAUTH_TOKEN
+            echo "Authenticating with an Anthropic API key."
+          else
+            echo "::error::Set either CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY as a repo secret."
+            exit 1
+          fi
+
+          MODEL_ARG=()
+          [ -n "${CLAUDE_MODEL:-}" ] && MODEL_ARG=(--model "$CLAUDE_MODEL")
+
+          claude -p "Produce today's episode of the daily news podcast.
+
+          Read brief.md in this directory and follow it exactly. digest.md has
+          already been generated for you and holds today's articles. Use
+          fetch_article.py to read the top stories in full before writing.
+
+          Write script.md and shownotes.md. Do not ask for confirmation; work to
+          completion autonomously." \
+            --permission-mode acceptEdits \
+            --allowedTools 'Read' 'Write' 'Edit' 'Bash' 'Glob' 'Grep' \
+            --add-dir "$PWD" \
+            "${MODEL_ARG[@]}"
+
+      - name: Sanity-check the script
+        run: |
+          set -euo pipefail
+          test -s script.md   || { echo "::error::script.md missing or empty"; exit 1; }
+          test -s shownotes.md || { echo "::error::shownotes.md missing or empty"; exit 1; }
+          WORDS=$(wc -w < script.md)
+          echo "script is $WORDS words"
+          if [ "$WORDS" -lt 900 ]; then
+            echo "::error::script is only $WORDS words — curation likely failed"; exit 1
+          fi
+          [ "$WORDS" -gt 2600 ] && echo "::warning::script is unusually long ($WORDS words)"
+          exit 0
+
+      - name: Render audio
+        run: python make_episode.py script.md -o episode.mp3 --meta-out episode.meta.json
+
+      - name: Verify audio
+        run: |
+          set -euo pipefail
+          BYTES=$(stat -c%s episode.mp3)
+          echo "episode.mp3 is $BYTES bytes"
+          [ "$BYTES" -ge 512000 ] || { echo "::error::render produced only $BYTES bytes"; exit 1; }
+
+      - name: Publish release
+        if: github.event_name == 'schedule' || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATE: ${{ needs.gate.outputs.date }}
+          PRETTY: ${{ needs.gate.outputs.pretty }}
+        run: |
+          set -euo pipefail
+          SECS=$(python -c "import json;print(json.load(open('episode.meta.json'))['seconds'])")
+          cp episode.mp3 "daily-wrap-${DATE}.mp3"
+          { cat shownotes.md; printf '\n\n<!-- duration_seconds: %s -->\n' "$SECS"; } > release-notes.md
+          # Re-running the same day replaces that day's episode rather than failing.
+          gh release delete "ep-${DATE}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "ep-${DATE}" \
+            --title "Daily Wrap — ${PRETTY}" \
+            --notes-file release-notes.md \
+            "daily-wrap-${DATE}.mp3"
+
+      - name: Keep the working files for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-${{ needs.gate.outputs.date }}
+          path: |
+            digest.md
+            script.md
+            shownotes.md
+            episode.meta.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  publish:
+    needs: [gate, build]
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build the feed from published releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PODCAST_SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+          PODCAST_IMAGE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/cover.png
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate \
+            | jq -s 'add // []' > releases.json
+          python make_feed.py --config podcast.json --out site < releases.json
+          cp cover.png site/cover.png
+          ls -la site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
