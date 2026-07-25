@@ -72,6 +72,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A token pasted through a terminal can pick up a CR, a wrapped line break
+      # or trailing space. Those are illegal in an HTTP header, and the only
+      # symptom is an opaque "Authorization has invalid value" raised two
+      # minutes in, after npm and 21 feed fetches have already run. Check it
+      # here instead, in five seconds, before anything expensive.
+      - name: Validate credentials
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          APIKEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${TOKEN:-}" ]; then
+            NAME=CLAUDE_CODE_OAUTH_TOKEN; VAL=$TOKEN; WANT=sk-ant-oat01-
+          elif [ -n "${APIKEY:-}" ]; then
+            NAME=ANTHROPIC_API_KEY; VAL=$APIKEY; WANT=sk-ant-
+          else
+            echo "::error::Set either CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY as a repo secret."
+            exit 1
+          fi
+
+          CLEAN=$(printf '%s' "$VAL" | tr -d '[:space:]')
+          if [ "${#CLEAN}" -ne "${#VAL}" ]; then
+            echo "::warning::$NAME had whitespace in it (${#VAL} chars, ${#CLEAN} without); stripping it. Worth re-pasting the secret cleanly."
+          fi
+
+          case "$CLEAN" in
+            "$WANT"*) echo "$NAME is well-formed (${#CLEAN} chars)." ;;
+            *) echo "::error::$NAME does not begin with '$WANT' — the wrong value was copied into the secret. Re-run 'claude setup-token' and set it again."
+               exit 1 ;;
+          esac
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -95,6 +126,11 @@ jobs:
           CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
         run: |
           set -euo pipefail
+          # Strip whitespace a terminal paste may have introduced; an embedded
+          # CR or newline is rejected outright as an HTTP header value.
+          CLAUDE_CODE_OAUTH_TOKEN=$(printf '%s' "${CLAUDE_CODE_OAUTH_TOKEN:-}" | tr -d '[:space:]')
+          ANTHROPIC_API_KEY=$(printf '%s' "${ANTHROPIC_API_KEY:-}" | tr -d '[:space:]')
+
           # Sending both credentials at once is rejected — keep exactly one.
           if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
             unset ANTHROPIC_API_KEY
