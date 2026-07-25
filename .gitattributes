@@ -1,0 +1,5 @@
+# The workflow's inline bash runs on Linux. A stray CR would break `set -euo
+# pipefail` and every heredoc in it, so force LF regardless of local git config.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
