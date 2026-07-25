@@ -98,10 +98,21 @@ jobs:
           fi
 
           case "$CLEAN" in
-            "$WANT"*) echo "$NAME is well-formed (${#CLEAN} chars)." ;;
+            "$WANT"*) ;;
             *) echo "::error::$NAME does not begin with '$WANT' — the wrong value was copied into the secret. Re-run 'claude setup-token' and set it again."
                exit 1 ;;
           esac
+
+          # The prefix alone is not enough. A token that wraps in the terminal
+          # gets truncated at the line break, and the surviving fragment still
+          # starts with the right prefix -- that is exactly how a 14-character
+          # secret passed an earlier version of this check.
+          if [ "${#CLEAN}" -lt 60 ]; then
+            echo "::error::$NAME is only ${#CLEAN} chars; a full token is ~100. The paste was truncated at a line break — copy the token and set the secret from the clipboard rather than typing it into a prompt."
+            exit 1
+          fi
+
+          echo "$NAME is well-formed (${#CLEAN} chars)."
 
       - uses: actions/setup-python@v5
         with:
