@@ -5,10 +5,17 @@ name: Daily Wrap
 # comparing Sydney's current UTC offset to the one each cron was written for.
 # This is robust to GitHub's habitual 5-20 minute scheduling delay, which a
 # naive "is it 8am in Sydney?" check is not.
+#
+# GitHub Actions schedules are also best-effort: it will occasionally drop a
+# cron firing entirely rather than just running it late (this has happened
+# in practice, not hypothetically). The third cron below is a fallback with
+# no offset requirement of its own — the gate job runs it only if neither
+# primary cron has published today's episode yet.
 on:
   schedule:
     - cron: '47 21 * * 0-4'   # 08:47 Sydney while AEDT (UTC+11) — Mon-Fri local
     - cron: '47 22 * * 0-4'   # 08:47 Sydney while AEST (UTC+10) — Mon-Fri local
+    - cron: '47 23 * * 0-4'   # fallback: catches up if both crons above misfired
   workflow_dispatch:
     inputs:
       publish:
@@ -39,10 +46,12 @@ jobs:
       - id: check
         env:
           SCHEDULE: ${{ github.event.schedule }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           OFFSET=$(TZ=Australia/Sydney date +%z)
-          echo "date=$(TZ=Australia/Sydney date +%F)"                >> "$GITHUB_OUTPUT"
+          DATE=$(TZ=Australia/Sydney date +%F)
+          echo "date=$DATE"                                          >> "$GITHUB_OUTPUT"
           echo "pretty=$(TZ=Australia/Sydney date '+%A %-d %B %Y')"  >> "$GITHUB_OUTPUT"
           echo "Sydney is currently UTC$OFFSET ($(TZ=Australia/Sydney date))"
 
@@ -54,10 +63,23 @@ jobs:
           case "$SCHEDULE" in
             '47 21 * * 0-4') WANT='+1100' ;;   # AEDT
             '47 22 * * 0-4') WANT='+1000' ;;   # AEST
+            '47 23 * * 0-4') WANT='' ;;        # fallback — see below
             *) echo "::error::Unrecognised schedule '$SCHEDULE'"; exit 1 ;;
           esac
 
-          if [ "$OFFSET" = "$WANT" ]; then
+          if [ -z "$WANT" ]; then
+            # Fallback cron: it has no offset of its own to match. Proceed
+            # only if neither primary cron got a release out for today —
+            # that's the signal that one of them was skipped by design
+            # (wrong offset) and the other never fired at all.
+            if gh release view "ep-$DATE" >/dev/null 2>&1; then
+              echo "ep-$DATE already published; nothing to catch up on."
+              echo "proceed=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "No release for $DATE yet; fallback cron is catching up."
+              echo "proceed=true" >> "$GITHUB_OUTPUT"
+            fi
+          elif [ "$OFFSET" = "$WANT" ]; then
             echo "proceed=true" >> "$GITHUB_OUTPUT"
           else
             echo "This cron covers UTC$WANT; skipping so the other one runs."
