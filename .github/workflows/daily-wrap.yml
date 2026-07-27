@@ -1,14 +1,33 @@
 name: Daily Wrap
 
-# GitHub cron is UTC and Sydney observes DST, so 08:47 local is a moving target.
-# Both crons are registered and the gate job lets exactly one through by
-# comparing Sydney's current UTC offset to the one each cron was written for.
-# This is robust to GitHub's habitual 5-20 minute scheduling delay, which a
-# naive "is it 8am in Sydney?" check is not.
+# GitHub cron is UTC and Sydney observes DST, so 08:47 local is a moving
+# target: 21:47 UTC under AEDT, 22:47 UTC under AEST. Both are registered,
+# plus an hour-later third as a spare. Day-of-week 0-4 is Sun-Thu in UTC,
+# which is Mon-Fri in Sydney at these hours.
+#
+# The gate deliberately does NOT work out which cron "should" own today.
+# An earlier version did, by matching each cron to the UTC offset it was
+# written for, and it lost two consecutive days: GitHub delivered the 21:47
+# firing 54 minutes late (08:41 Sydney — a perfectly good time to publish)
+# and the gate threw it away for carrying the wrong offset, while the 22:47
+# firing that was supposed to cover AEST never arrived at all. Scheduled
+# workflows are best-effort; assuming they fire near their nominal time is
+# the bug.
+#
+# So the gate asks two questions instead, neither of which cares which cron
+# woke it:
+#
+#   1. Is it a sensible hour in Sydney right now?
+#   2. Has today's episode not already been published?
+#
+# Whichever firing lands first inside the window does the work; later ones
+# find the release present and stand down. A late run gets used rather than
+# discarded, and a dropped one costs nothing so long as a sibling arrives.
 on:
   schedule:
-    - cron: '47 21 * * 0-4'   # 08:47 Sydney while AEDT (UTC+11) — Mon-Fri local
-    - cron: '47 22 * * 0-4'   # 08:47 Sydney while AEST (UTC+10) — Mon-Fri local
+    - cron: '47 21 * * 0-4'   # 08:47 Sydney under AEDT / 07:47 under AEST
+    - cron: '47 22 * * 0-4'   # 09:47 Sydney under AEDT / 08:47 under AEST
+    - cron: '47 23 * * 0-4'   # spare, an hour behind whichever of those is live
   workflow_dispatch:
     inputs:
       publish:
@@ -39,29 +58,46 @@ jobs:
       - id: check
         env:
           SCHEDULE: ${{ github.event.schedule }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          OFFSET=$(TZ=Australia/Sydney date +%z)
-          echo "date=$(TZ=Australia/Sydney date +%F)"                >> "$GITHUB_OUTPUT"
+          DATE=$(TZ=Australia/Sydney date +%F)
+          echo "date=$DATE"                                          >> "$GITHUB_OUTPUT"
           echo "pretty=$(TZ=Australia/Sydney date '+%A %-d %B %Y')"  >> "$GITHUB_OUTPUT"
-          echo "Sydney is currently UTC$OFFSET ($(TZ=Australia/Sydney date))"
+          echo "Sydney is currently $(TZ=Australia/Sydney date) (triggered by '${SCHEDULE:-manual}')"
 
           if [ -z "${SCHEDULE:-}" ]; then
-            echo "Manual run — proceeding."
+            echo "Manual run — proceeding regardless of hour."
             echo "proceed=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
 
-          case "$SCHEDULE" in
-            '47 21 * * 0-4') WANT='+1100' ;;   # AEDT
-            '47 22 * * 0-4') WANT='+1000' ;;   # AEST
-            *) echo "::error::Unrecognised schedule '$SCHEDULE'"; exit 1 ;;
-          esac
+          # Publish window in Sydney local time. 08:47 remains the intended
+          # delivery; the width is tolerance for GitHub's scheduling drift,
+          # measured at ~54 minutes. Widen it to miss fewer days, narrow it
+          # to bias towards punctuality at the cost of missing more.
+          OPEN=510    # 08:30
+          CLOSE=660   # 11:00
 
-          if [ "$OFFSET" = "$WANT" ]; then
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "This cron covers UTC$WANT; skipping so the other one runs."
+          # 10# forces base 10 — date zero-pads, and bash reads 08 and 09 as
+          # invalid octal.
+          H=$(TZ=Australia/Sydney date +%H)
+          M=$(TZ=Australia/Sydney date +%M)
+          NOW=$(( 10#$H * 60 + 10#$M ))
+
+          if [ "$NOW" -lt "$OPEN" ] || [ "$NOW" -gt "$CLOSE" ]; then
+            echo "Sydney local time is outside the 08:30-11:00 publish window; skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # Whichever firing gets here first builds the episode; the others
+          # find it already published and stand down. This is what makes a
+          # late or duplicated cron harmless.
+          if gh release view "ep-$DATE" >/dev/null 2>&1; then
+            echo "ep-$DATE is already published; nothing to do."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No release for $DATE yet and we are inside the window; proceeding."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
           fi
 
   build:
