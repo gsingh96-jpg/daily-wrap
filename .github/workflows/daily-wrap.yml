@@ -104,7 +104,9 @@ jobs:
     needs: gate
     if: needs.gate.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Raised from 30: the render step can now spend up to ~23 minutes across
+    # four attempts and their backoff before it gives up.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -154,8 +156,17 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # Deliberately a range, not an exact pin. The render failures are the
+      # endpoint refusing CI traffic, not version drift -- it fails and
+      # succeeds on adjacent days from the same unpinned install -- and
+      # edge-tts releases are what track Microsoft's auth changes, so freezing
+      # one version risks being stuck on a broken one. The major bound keeps a
+      # 8.x API break out, and the version is logged so a run is diagnosable.
       - name: Install edge-tts
-        run: pip install --quiet edge-tts
+        run: |
+          set -euo pipefail
+          pip install --quiet 'edge-tts>=7.3,<8'
+          python -c "import importlib.metadata as m; print('edge-tts', m.version('edge-tts'))"
 
       - name: Install Claude Code
         run: |
