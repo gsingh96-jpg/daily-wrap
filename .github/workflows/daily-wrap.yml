@@ -15,6 +15,15 @@ on:
         description: 'Publish a release and update the feed'
         type: boolean
         default: true
+      # The feed is the thing podcast apps actually read, and it is rebuilt
+      # from whatever releases exist -- it does not need a fresh episode. Tying
+      # a redeploy to a build meant a flaky TTS render could keep a week of
+      # already-published episodes out of the feed, which is what happened
+      # from 18 to 25 Nov. This runs the publish job on its own.
+      feed_only:
+        description: 'Skip the build; just rebuild and redeploy the feed from existing releases'
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # create releases
@@ -66,7 +75,9 @@ jobs:
 
   build:
     needs: gate
-    if: needs.gate.outputs.proceed == 'true'
+    # inputs.feed_only is null on a schedule, and null != true, so a scheduled
+    # run always builds.
+    if: needs.gate.outputs.proceed == 'true' && inputs.feed_only != true
     runs-on: ubuntu-latest
     # Raised from 30: good renders have been measured at 9-11 minutes, so the
     # render step can now spend up to ~62 minutes across three attempts and
@@ -239,7 +250,13 @@ jobs:
 
   publish:
     needs: [gate, build]
-    if: needs.gate.outputs.proceed == 'true'
+    # A skipped dependency would normally skip this job too, so feed_only needs
+    # build's 'skipped' spelled out. A build that *failed* still stops the
+    # deploy, as before -- there would be no new episode to put in the feed.
+    if: >-
+      !cancelled()
+      && needs.gate.outputs.proceed == 'true'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -264,9 +281,27 @@ jobs:
           cp cover.png site/cover.png
           ls -la site
 
-      - uses: actions/upload-pages-artifact@v3
+      # These two must move together. The old pair -- upload-pages-artifact@v3
+      # (v3.0.1, Feb 2024) and deploy-pages@v4 (v4.0.5, Mar 2024) -- is the
+      # combination the docs bless, and it worked for months, but it has failed
+      # every run since 24 Nov with:
+      #
+      #   Found 1 artifact(s)
+      #   Error: No artifacts named "github-pages" were found for this workflow
+      #   run. Ensure artifacts are uploaded with actions/upload-artifact@v4 or
+      #   later.
+      #
+      # The one artifact it does see is the build job's run-<date>, uploaded by
+      # a current upload-artifact; the pages artifact is written by the old
+      # upload-artifact that v3.0.1 pins and is no longer visible to the
+      # reader. Hence current majors on both sides rather than one.
+      #
+      # upload-pages-artifact v4 stopped including dotfiles. Harmless here --
+      # the site is only feed.xml, index.html and cover.png, no .nojekyll --
+      # otherwise this would need include-hidden-files: true.
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
