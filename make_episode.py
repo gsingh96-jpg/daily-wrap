@@ -76,12 +76,69 @@ def mp3_duration(path):
     return total
 
 
-async def render(text, out_path, voice, rate, pitch):
+# edge-tts talks to a free Microsoft endpoint that intermittently refuses
+# traffic from CI runners. Both shapes have been seen in this repo: a
+# NoAudioReceived three seconds in, and a stall that burned nine minutes before
+# failing. Each is transient and each used to cost a whole episode, so every
+# attempt now gets its own deadline and we back off between them.
+# The deadline has to clear a *successful* slow render, not the healthy case.
+# Measured on this repo: ~160s back in July, then on 25 Nov two good renders
+# at 9m14s and 11m16s, while the 20 Nov failure stalled 8m58s before giving
+# up. Success and failure durations overlap, so no deadline separates "slow"
+# from "stuck". 20 minutes just buys enough room that a slow-but-fine render
+# is never killed -- the retries, not the deadline, are what rescue a genuine
+# refusal. Keep this well clear of the slowest success you have seen.
+ATTEMPT_TIMEOUT = 1200
+BACKOFF = (30, 90)              # waits between attempts; len + 1 == attempts
+
+_TRANSIENT = (edge_tts.exceptions.EdgeTTSException, asyncio.TimeoutError, OSError)
+try:  # aiohttp is edge-tts's transport; a mid-stream disconnect surfaces here
+    from aiohttp import ClientError as _ClientError
+except ImportError:
+    pass
+else:
+    _TRANSIENT += (_ClientError,)
+
+
+async def _render_once(text, voice, rate, pitch):
+    """One synthesis attempt, buffered in memory. Returns mp3 bytes or raises."""
     comm = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-    with open(out_path, "wb") as f:
-        async for chunk in comm.stream():
-            if chunk["type"] == "audio":
-                f.write(chunk["data"])
+    buf = bytearray()
+    async for chunk in comm.stream():
+        if chunk["type"] == "audio":
+            buf.extend(chunk["data"])
+    if not buf:
+        # The stream can close cleanly having sent no audio at all.
+        raise edge_tts.exceptions.NoAudioReceived("stream ended with no audio")
+    return bytes(buf)
+
+
+async def render(text, out_path, voice, rate, pitch):
+    """Synthesise with retries. out_path is written only once audio is in hand,
+    so a failed attempt can never leave a half-rendered mp3 behind for the
+    caller -- or for the workflow's size check -- to mistake for a good one."""
+    for attempt in range(1, len(BACKOFF) + 2):
+        try:
+            audio = await asyncio.wait_for(
+                _render_once(text, voice, rate, pitch), ATTEMPT_TIMEOUT
+            )
+        except _TRANSIENT as e:
+            why = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+            if attempt > len(BACKOFF):
+                print(f"render: attempt {attempt} failed ({why}); giving up",
+                      file=sys.stderr, flush=True)
+                raise
+            wait = BACKOFF[attempt - 1]
+            print(f"render: attempt {attempt} failed ({why}); retrying in {wait}s",
+                  file=sys.stderr, flush=True)
+            await asyncio.sleep(wait)
+        else:
+            if attempt > 1:
+                print(f"render: succeeded on attempt {attempt}",
+                      file=sys.stderr, flush=True)
+            with open(out_path, "wb") as f:
+                f.write(audio)
+            return
 
 
 def main():
