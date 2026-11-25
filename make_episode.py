@@ -81,8 +81,14 @@ def mp3_duration(path):
 # NoAudioReceived three seconds in, and a stall that burned nine minutes before
 # failing. Each is transient and each used to cost a whole episode, so every
 # attempt now gets its own deadline and we back off between them.
-ATTEMPT_TIMEOUT = 300           # a healthy ~1500-word render takes about 160s
-BACKOFF = (20, 60, 120)         # waits between attempts; len + 1 == attempts
+# The deadline has to clear a *successful* slow render, not the healthy case.
+# Measured on this repo: ~160s back in July, but 9m14s for a good render on
+# 25 Nov, and the 20 Nov failure stalled 8m58s before giving up. Those overlap,
+# so there is no deadline that separates "slow" from "stuck" -- 15 minutes
+# simply buys enough room that a slow-but-fine render is never killed, while
+# still turning a true hang into a retry instead of a lost day.
+ATTEMPT_TIMEOUT = 900
+BACKOFF = (30, 90)              # waits between attempts; len + 1 == attempts
 
 _TRANSIENT = (edge_tts.exceptions.EdgeTTSException, asyncio.TimeoutError, OSError)
 try:  # aiohttp is edge-tts's transport; a mid-stream disconnect surfaces here
