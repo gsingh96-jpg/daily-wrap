@@ -1,20 +1,48 @@
 name: Daily Wrap
 
-# GitHub cron is UTC and Sydney observes DST, so 08:47 local is a moving target.
-# Both crons are registered and the gate job lets exactly one through by
-# comparing Sydney's current UTC offset to the one each cron was written for.
-# This is robust to GitHub's habitual 5-20 minute scheduling delay, which a
-# naive "is it 8am in Sydney?" check is not.
+# GitHub cron is UTC and Sydney observes DST, so 08:47 local is a moving
+# target: 21:47 UTC under AEDT, 22:47 UTC under AEST. Both are registered,
+# plus an hour-later third as a spare. Day-of-week 0-4 is Sun-Thu in UTC,
+# which is Mon-Fri in Sydney at these hours.
+#
+# The gate deliberately does NOT work out which cron "should" own today.
+# An earlier version did, by matching each cron to the UTC offset it was
+# written for, and it lost two consecutive days: GitHub delivered the 21:47
+# firing 54 minutes late (08:41 Sydney — a perfectly good time to publish)
+# and the gate threw it away for carrying the wrong offset, while the 22:47
+# firing that was supposed to cover AEST never arrived at all. Scheduled
+# workflows are best-effort; assuming they fire near their nominal time is
+# the bug.
+#
+# So the gate asks two questions instead, neither of which cares which cron
+# woke it:
+#
+#   1. Is it a sensible hour in Sydney right now?
+#   2. Has today's episode not already been published?
+#
+# Whichever firing lands first inside the window does the work; later ones
+# find the release present and stand down. A late run gets used rather than
+# discarded, and a dropped one costs nothing so long as a sibling arrives.
 on:
   schedule:
-    - cron: '47 21 * * 0-4'   # 08:47 Sydney while AEDT (UTC+11) — Mon-Fri local
-    - cron: '47 22 * * 0-4'   # 08:47 Sydney while AEST (UTC+10) — Mon-Fri local
+    - cron: '47 21 * * 0-4'   # 08:47 Sydney under AEDT / 07:47 under AEST
+    - cron: '47 22 * * 0-4'   # 09:47 Sydney under AEDT / 08:47 under AEST
+    - cron: '47 23 * * 0-4'   # spare, an hour behind whichever of those is live
   workflow_dispatch:
     inputs:
       publish:
         description: 'Publish a release and update the feed'
         type: boolean
         default: true
+      # The feed is the thing podcast apps actually read, and it is rebuilt
+      # from whatever releases exist -- it does not need a fresh episode. Tying
+      # a redeploy to a build meant a flaky TTS render could keep a week of
+      # already-published episodes out of the feed, which is what happened
+      # from 18 to 25 Nov. This runs the publish job on its own.
+      feed_only:
+        description: 'Skip the build; just rebuild and redeploy the feed from existing releases'
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # create releases
@@ -39,36 +67,59 @@ jobs:
       - id: check
         env:
           SCHEDULE: ${{ github.event.schedule }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          OFFSET=$(TZ=Australia/Sydney date +%z)
-          echo "date=$(TZ=Australia/Sydney date +%F)"                >> "$GITHUB_OUTPUT"
+          DATE=$(TZ=Australia/Sydney date +%F)
+          echo "date=$DATE"                                          >> "$GITHUB_OUTPUT"
           echo "pretty=$(TZ=Australia/Sydney date '+%A %-d %B %Y')"  >> "$GITHUB_OUTPUT"
-          echo "Sydney is currently UTC$OFFSET ($(TZ=Australia/Sydney date))"
+          echo "Sydney is currently $(TZ=Australia/Sydney date) (triggered by '${SCHEDULE:-manual}')"
 
           if [ -z "${SCHEDULE:-}" ]; then
-            echo "Manual run — proceeding."
+            echo "Manual run — proceeding regardless of hour."
             echo "proceed=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
 
-          case "$SCHEDULE" in
-            '47 21 * * 0-4') WANT='+1100' ;;   # AEDT
-            '47 22 * * 0-4') WANT='+1000' ;;   # AEST
-            *) echo "::error::Unrecognised schedule '$SCHEDULE'"; exit 1 ;;
-          esac
+          # Publish window in Sydney local time. 08:47 remains the intended
+          # delivery; the width is tolerance for GitHub's scheduling drift,
+          # measured at ~54 minutes. Widen it to miss fewer days, narrow it
+          # to bias towards punctuality at the cost of missing more.
+          OPEN=510    # 08:30
+          CLOSE=660   # 11:00
 
-          if [ "$OFFSET" = "$WANT" ]; then
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "This cron covers UTC$WANT; skipping so the other one runs."
+          # 10# forces base 10 — date zero-pads, and bash reads 08 and 09 as
+          # invalid octal.
+          H=$(TZ=Australia/Sydney date +%H)
+          M=$(TZ=Australia/Sydney date +%M)
+          NOW=$(( 10#$H * 60 + 10#$M ))
+
+          if [ "$NOW" -lt "$OPEN" ] || [ "$NOW" -gt "$CLOSE" ]; then
+            echo "Sydney local time is outside the 08:30-11:00 publish window; skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # Whichever firing gets here first builds the episode; the others
+          # find it already published and stand down. This is what makes a
+          # late or duplicated cron harmless.
+          if gh release view "ep-$DATE" >/dev/null 2>&1; then
+            echo "ep-$DATE is already published; nothing to do."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No release for $DATE yet and we are inside the window; proceeding."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
           fi
 
   build:
     needs: gate
-    if: needs.gate.outputs.proceed == 'true'
+    # inputs.feed_only is null on a schedule, and null != true, so a scheduled
+    # run always builds.
+    if: needs.gate.outputs.proceed == 'true' && inputs.feed_only != true
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Raised from 30: good renders have been measured at 9-11 minutes, so the
+    # render step can now spend up to ~62 minutes across three attempts and
+    # their backoff before it gives up. Actions minutes are free on a public
+    # repo, so the headroom costs nothing and saves the episode.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
@@ -118,8 +169,17 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # Deliberately a range, not an exact pin. The render failures are the
+      # endpoint refusing CI traffic, not version drift -- it fails and
+      # succeeds on adjacent days from the same unpinned install -- and
+      # edge-tts releases are what track Microsoft's auth changes, so freezing
+      # one version risks being stuck on a broken one. The major bound keeps a
+      # 8.x API break out, and the version is logged so a run is diagnosable.
       - name: Install edge-tts
-        run: pip install --quiet edge-tts
+        run: |
+          set -euo pipefail
+          pip install --quiet 'edge-tts>=7.3,<8'
+          python -c "import importlib.metadata as m; print('edge-tts', m.version('edge-tts'))"
 
       - name: Install Claude Code
         run: |
@@ -226,7 +286,13 @@ jobs:
 
   publish:
     needs: [gate, build]
-    if: needs.gate.outputs.proceed == 'true'
+    # A skipped dependency would normally skip this job too, so feed_only needs
+    # build's 'skipped' spelled out. A build that *failed* still stops the
+    # deploy, as before -- there would be no new episode to put in the feed.
+    if: >-
+      !cancelled()
+      && needs.gate.outputs.proceed == 'true'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -251,9 +317,27 @@ jobs:
           cp cover.png site/cover.png
           ls -la site
 
-      - uses: actions/upload-pages-artifact@v3
+      # These two must move together. The old pair -- upload-pages-artifact@v3
+      # (v3.0.1, Feb 2024) and deploy-pages@v4 (v4.0.5, Mar 2024) -- is the
+      # combination the docs bless, and it worked for months, but it has failed
+      # every run since 24 Nov with:
+      #
+      #   Found 1 artifact(s)
+      #   Error: No artifacts named "github-pages" were found for this workflow
+      #   run. Ensure artifacts are uploaded with actions/upload-artifact@v4 or
+      #   later.
+      #
+      # The one artifact it does see is the build job's run-<date>, uploaded by
+      # a current upload-artifact; the pages artifact is written by the old
+      # upload-artifact that v3.0.1 pins and is no longer visible to the
+      # reader. Hence current majors on both sides rather than one.
+      #
+      # upload-pages-artifact v4 stopped including dotfiles. Harmless here --
+      # the site is only feed.xml, index.html and cover.png, no .nojekyll --
+      # otherwise this would need include-hidden-files: true.
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
