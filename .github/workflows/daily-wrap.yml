@@ -68,11 +68,11 @@ jobs:
     needs: gate
     if: needs.gate.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    # Raised from 30: a single good render has been measured at over 9 minutes,
-    # so the render step can now spend up to ~47 minutes across three attempts
-    # and their backoff before it gives up. Actions minutes are free on a
-    # public repo, so the headroom costs nothing and saves the episode.
-    timeout-minutes: 60
+    # Raised from 30: good renders have been measured at 9-11 minutes, so the
+    # render step can now spend up to ~62 minutes across three attempts and
+    # their backoff before it gives up. Actions minutes are free on a public
+    # repo, so the headroom costs nothing and saves the episode.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
