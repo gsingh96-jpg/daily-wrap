@@ -82,12 +82,13 @@ def mp3_duration(path):
 # failing. Each is transient and each used to cost a whole episode, so every
 # attempt now gets its own deadline and we back off between them.
 # The deadline has to clear a *successful* slow render, not the healthy case.
-# Measured on this repo: ~160s back in July, but 9m14s for a good render on
-# 25 Nov, and the 20 Nov failure stalled 8m58s before giving up. Those overlap,
-# so there is no deadline that separates "slow" from "stuck" -- 15 minutes
-# simply buys enough room that a slow-but-fine render is never killed, while
-# still turning a true hang into a retry instead of a lost day.
-ATTEMPT_TIMEOUT = 900
+# Measured on this repo: ~160s back in July, then on 25 Nov two good renders
+# at 9m14s and 11m16s, while the 20 Nov failure stalled 8m58s before giving
+# up. Success and failure durations overlap, so no deadline separates "slow"
+# from "stuck". 20 minutes just buys enough room that a slow-but-fine render
+# is never killed -- the retries, not the deadline, are what rescue a genuine
+# refusal. Keep this well clear of the slowest success you have seen.
+ATTEMPT_TIMEOUT = 1200
 BACKOFF = (30, 90)              # waits between attempts; len + 1 == attempts
 
 _TRANSIENT = (edge_tts.exceptions.EdgeTTSException, asyncio.TimeoutError, OSError)
